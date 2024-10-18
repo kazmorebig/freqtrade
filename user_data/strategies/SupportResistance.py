@@ -37,6 +37,7 @@ from freqtrade.strategy import (
 import talib.abstract as ta
 import pandas_ta as pta
 from technical import qtpylib
+from scipy import stats
 
 
 class SupportResistance(IStrategy):
@@ -69,14 +70,15 @@ class SupportResistance(IStrategy):
     # Minimal ROI designed for the strategy.
     # This attribute will be overridden if the config file contains "minimal_roi".
     minimal_roi = {
-        "60": 0.01,
-        "30": 0.02,
-        "0": 0.04
+        "1440": 0,
+        # "60": 0.01,
+        # "30": 0.02,
+        # "0": 0.04
     }
 
     # Optimal stoploss designed for the strategy.
     # This attribute will be overridden if the config file contains "stoploss".
-    stoploss = -0.10
+    stoploss = -1.0
 
     # Trailing stoploss
     trailing_stop = False
@@ -93,7 +95,7 @@ class SupportResistance(IStrategy):
     ignore_roi_if_entry_signal = False
 
     # Number of candles the strategy requires before producing valid signals
-    startup_candle_count: int = 30
+    startup_candle_count: int = 200
 
     # Strategy parameters
     buy_rsi = IntParameter(10, 40, default=30, space="buy")
@@ -102,8 +104,12 @@ class SupportResistance(IStrategy):
     plot_config = {
         "main_plot": {
             "tema": {"color": "blue"},
-            "resistance": {"color": "red"},
-            "support": {"color": "green"},
+            "resistance_0": {"color": "red"},
+            "resistance_1": {"color": "red"},
+            "resistance_2": {"color": "red"},
+            "support_0": {"color": "green"},
+            "support_1": {"color": "green"},
+            "support_2": {"color": "green"},
         },
         "subplots": {
         }
@@ -137,29 +143,32 @@ class SupportResistance(IStrategy):
         # Momentum Indicators
         # ------------------------------------
 
-        def support_agg(x):
-            logging.info(f'X: {x}')
-            cur_price = x["close"][0]
-            h, e = np.histogram(x["low_shifted"], range=(cur_price * 0.90, cur_price))
-            return e.take(h.argmax())
+        def support_agg(x, k=0):
+            h, e = np.histogram(x, 50, range=(x.min(), x.iloc[-1]))
+            # h, e = np.histogram(x, 10)
+            return e.take(np.argsort(h)[::-1][k])
 
-        def resistance_agg(x):
-            cur_price = x["close"][0]
-            h, e = np.histogram(x["high_shifted"], range=(cur_price, cur_price * 1.10))
-            return e.take(h.argmax())
+        def resistance_agg(x, k=0):
+            h, e = np.histogram(x, 50, range=(x.iloc[-1], x.max()))
+            # h, e = np.histogram(x, 10)
+            return e.take(np.argsort(h)[::-1][k])
 
         dataframe["rsi"] = ta.RSI(dataframe)
         dataframe["tema"] = ta.TEMA(dataframe)
-
-        back_df = (dataframe.loc[:, ("low", "high", "close")].join(
-            dataframe.loc[:, ("low", "high", "close")].shift(self.startup_candle_count),
-            lsuffix="",
-            rsuffix='_shifted'))
-        dataframe["support"] = back_df.rolling(self.startup_candle_count, method='table').apply(support_agg)
-        dataframe["resistance"] = back_df.rolling(self.startup_candle_count, method='table').apply(resistance_agg)
-
-        dataframe["d_tema"] = (dataframe["tema"] / dataframe["tema"].shift(1) - 1) * 100
-
+        dataframe["support_0"] = dataframe["support_1"] = dataframe["support_2"] = dataframe["low"]
+        dataframe["resistance_0"] = dataframe["resistance_1"] = dataframe["resistance_2"] = dataframe["high"]
+        dataframe.update(dataframe.rolling(10).agg({
+            "support_0": lambda x: support_agg(x),
+            "resistance_0": lambda x: resistance_agg(x)
+        }))
+        dataframe.update(dataframe.rolling(100).agg({
+            "support_1": lambda x: support_agg(x),
+            "resistance_1": lambda x: resistance_agg(x)
+        }))
+        dataframe.update(dataframe.rolling(200).agg({
+            "support_2": lambda x: support_agg(x),
+            "resistance_2": lambda x: resistance_agg(x)
+        }))
         # Retrieve best bid and best ask from the orderbook
         # ------------------------------------
         """
@@ -171,6 +180,7 @@ class SupportResistance(IStrategy):
                 dataframe["best_ask"] = ob["asks"][0][0]
         """
 
+
         return dataframe
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
@@ -180,20 +190,23 @@ class SupportResistance(IStrategy):
         :param metadata: Additional information, like the currently traded pair
         :return: DataFrame with entry columns populated
         """
+        # shifted = dataframe.shift(1)
+        targets = dataframe.loc[:, ("resistance_0", "resistance_1", "resistance_2")].max(axis=1)
         dataframe.loc[
             (
-                (qtpylib.crossed_above(dataframe["rsi"], self.buy_rsi.value)) &  # Signal: RSI crosses above buy_rsi
+                (dataframe["low"] < dataframe["support_1"]) &
+                (targets / dataframe["close"] >= 1.005) &
                 (dataframe["volume"] > 0)  # Make sure Volume is not 0
             ),
             "enter_long"] = 1
         # Uncomment to use shorts (Only used in futures/margin mode. Check the documentation for more info)
 
-        dataframe.loc[
-            (
-                (qtpylib.crossed_above(dataframe["rsi"], self.sell_rsi.value)) &  # Signal: RSI crosses above sell_rsi
-                (dataframe['volume'] > 0)  # Make sure Volume is not 0
-            ),
-            'enter_short'] = 1
+        # dataframe.loc[
+        #     (
+        #         (qtpylib.crossed_above(dataframe["rsi"], self.sell_rsi.value)) &  # Signal: RSI crosses above sell_rsi
+        #         (dataframe['volume'] > 0)  # Make sure Volume is not 0
+        #     ),
+        #     'enter_short'] = 1
 
 
         return dataframe
@@ -205,19 +218,36 @@ class SupportResistance(IStrategy):
         :param metadata: Additional information, like the currently traded pair
         :return: DataFrame with exit columns populated
         """
-        dataframe.loc[
-            (
-                (qtpylib.crossed_above(dataframe["rsi"], self.sell_rsi.value)) &  # Signal: RSI crosses above sell_rsi
-                (dataframe["volume"] > 0)  # Make sure Volume is not 0
-            ),
-            "exit_long"] = 1
+        # dataframe.loc[
+        #     (
+        #         (qtpylib.crossed_above(dataframe["close"], dataframe.shift(1)["resistance_0"])) &  # Signal: RSI crosses above sell_rsi
+        #         (dataframe["volume"] > 0)  # Make sure Volume is not 0
+        #     ),
+        #     "exit_long"] = 1
         # Uncomment to use shorts (Only used in futures/margin mode. Check the documentation for more info)
 
-        dataframe.loc[
-            (
-                (qtpylib.crossed_above(dataframe["rsi"], self.buy_rsi.value)) &  # Signal: RSI crosses above buy_rsi
-                (dataframe['volume'] > 0)  # Make sure Volume is not 0
-            ),
-            'exit_short'] = 1
+        # dataframe.loc[
+        #     (
+        #         (qtpylib.crossed_above(dataframe["rsi"], self.buy_rsi.value)) &  # Signal: RSI crosses above buy_rsi
+        #         (dataframe['volume'] > 0)  # Make sure Volume is not 0
+        #     ),
+        #     'exit_short'] = 1
 
         return dataframe
+
+    def bot_loop_start(self, **kwargs) -> None:
+        for trade in Trade.get_open_trades():
+            if trade.get_custom_data('target_rate') is None:
+                dataframe, _ = self.dp.get_analyzed_dataframe(trade.pair, self.timeframe)
+                last_candle = dataframe.iloc[-2].squeeze()
+                target = max([last_candle[f'resistance_{i}'] for i in range(3)])
+                trade.set_custom_data('target_rate', target)
+        return super().bot_loop_start(**kwargs)
+
+    def custom_exit(self, pair: str, trade: 'Trade', current_time: 'datetime', current_rate: float,
+                    current_profit: float, **kwargs):
+
+        if trade.get_custom_data('target_rate'):
+            if current_rate >= trade.get_custom_data('target_rate'):
+                logging.info(f'Force exit: {current_rate} >= {trade.get_custom_data("target_rate")}')
+                return 'force_exit'
