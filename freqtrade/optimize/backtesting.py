@@ -1332,9 +1332,8 @@ class Backtesting:
         row: tuple,
         pair: str,
         current_time: datetime,
-        end_date: datetime,
         trade_dir: Optional[LongShort],
-        is_first: bool = True,
+        can_enter: bool,
     ) -> None:
         """
         NOTE: This method is used by Hyperopt at each iteration. Please keep it optimized.
@@ -1344,7 +1343,7 @@ class Backtesting:
         for t in list(LocalTrade.bt_trades_open_pp[pair]):
             # 1. Manage currently open orders of active trades
             if self.manage_open_orders(t, current_time, row):
-                # Close trade
+                # Remove trade (initial open order never filled)
                 LocalTrade.remove_bt_trade(t)
                 self.wallets.update()
 
@@ -1354,10 +1353,9 @@ class Backtesting:
         # don't open on the last row
         # We only open trades on the main candle, not on detail candles
         if (
-            (self._position_stacking or len(LocalTrade.bt_trades_open_pp[pair]) == 0)
-            and is_first
-            and current_time != end_date
+            can_enter
             and trade_dir is not None
+            and (self._position_stacking or len(LocalTrade.bt_trades_open_pp[pair]) == 0)
             and not PairLocks.is_pair_locked(pair, row[DATE_IDX], trade_dir)
         ):
             if self.trade_slot_available(LocalTrade.bt_open_open_trade_count):
@@ -1429,10 +1427,10 @@ class Backtesting:
         indexes: dict = defaultdict(int)
 
         # Loop timerange and get candle for each pair at that point in time
-        for current_time, pair, is_first in self.time_pair_generator(
+        for current_time, pair, is_first_call in self.time_pair_generator(
             start_date, end_date, self.timeframe_td, list(data.keys())
         ):
-            if is_first:
+            if is_first_call:
                 self.check_abort()
                 strategy_safe_wrapper(self.strategy.bot_loop_start, supress_error=True)(
                     current_time=current_time
@@ -1444,6 +1442,7 @@ class Backtesting:
 
             row_index += 1
             indexes[pair] = row_index
+            is_last_row = current_time == end_date
             self.dataprovider._set_dataframe_max_index(self.required_startup + row_index)
             self.dataprovider._set_dataframe_max_date(current_time)
             current_detail_time: datetime = row[DATE_IDX].to_pydatetime()
@@ -1466,7 +1465,8 @@ class Backtesting:
                 ].copy()
                 if len(detail_data) == 0:
                     # Fall back to "regular" data if no detail data was found for this candle
-                    self.backtest_loop(row, pair, current_time, end_date, trade_dir)
+                    self.dataprovider._set_dataframe_max_date(current_time)
+                    self.backtest_loop(row, pair, current_time, trade_dir, not is_last_row)
                     continue
                 detail_data.loc[:, "enter_long"] = row[LONG_IDX]
                 detail_data.loc[:, "exit_long"] = row[ELONG_IDX]
@@ -1482,15 +1482,14 @@ class Backtesting:
                         det_row,
                         pair,
                         current_time_det,
-                        end_date,
                         trade_dir,
-                        is_first,
+                        is_first and not is_last_row,
                     )
                     current_time_det += self.timeframe_detail_td
                     is_first = False
             else:
                 self.dataprovider._set_dataframe_max_date(current_time)
-                self.backtest_loop(row, pair, current_time, end_date, trade_dir)
+                self.backtest_loop(row, pair, current_time, trade_dir, not is_last_row)
 
         self.handle_left_open(LocalTrade.bt_trades_open_pp, data=data)
         self.wallets.update()

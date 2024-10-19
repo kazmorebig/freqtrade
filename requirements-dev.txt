@@ -9,7 +9,7 @@
 coveralls==4.0.1
 ruff==0.6.9
 mypy==1.11.2
-pre-commit==4.0.0
+pre-commit==4.0.1
 pytest==8.3.3
 pytest-asyncio==0.24.0
 pytest-cov==5.0.0
@@ -19,7 +19,7 @@ pytest-timeout==2.3.1
 pytest-xdist==3.6.1
 isort==5.13.2
 # For datetime mocking
-time-machine==2.15.0
+time-machine==2.16.0
 
 # Convert jupyter notebooks to markdown documents
 nbconvert==7.16.4
