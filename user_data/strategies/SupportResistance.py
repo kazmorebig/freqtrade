@@ -65,12 +65,12 @@ class SupportResistance(IStrategy):
     timeframe = "5m"
 
     # Can this strategy go short?
-    can_short: bool = True
+    can_short: bool = False
 
     # Minimal ROI designed for the strategy.
     # This attribute will be overridden if the config file contains "minimal_roi".
     minimal_roi = {
-        "1440": 0,
+        "720": 0,
         # "60": 0.01,
         # "30": 0.02,
         # "0": 0.04
@@ -78,6 +78,7 @@ class SupportResistance(IStrategy):
 
     # Optimal stoploss designed for the strategy.
     # This attribute will be overridden if the config file contains "stoploss".
+    use_custom_stoploss = True
     stoploss = -1
 
     # Trailing stoploss
@@ -98,9 +99,15 @@ class SupportResistance(IStrategy):
     # Number of candles the strategy requires before producing valid signals
     startup_candle_count: int = 200
 
+    start_bounce_loss = -0.01  # Loss threshold where start to bounce
+    max_bounce_loss = -0.05  # Loss for selling bounce
+    max_bounce_count = 2  # Number of bounces from support / resistance levels
+    min_bounce_diff = 0.005  # Minimum difference between bounces
+    min_bounce_interval = 30  # Minimum interval between bounces in minutes
+
     # Strategy parameters
-    buy_rsi = IntParameter(10, 40, default=30, space="buy")
-    sell_rsi = IntParameter(60, 90, default=70, space="sell")
+    # buy_rsi = IntParameter(10, 40, default=30, space="buy")
+    # sell_rsi = IntParameter(60, 90, default=70, space="sell")
 
     plot_config = {
         "main_plot": {
@@ -127,7 +134,8 @@ class SupportResistance(IStrategy):
                             ("BTC/USDT", "15m"),
                             ]
         """
-        return []
+        pairs = self.dp.current_whitelist()
+        return [(pair, '1h') for pair in pairs]
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """
@@ -268,7 +276,7 @@ class SupportResistance(IStrategy):
         dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
         last_candle = dataframe.iloc[-1]
         if current_rate >= last_candle['resistance_0']:
-            if current_profit > 0.02:
+            if current_profit > 0.05:
                 return 'immediate_profit'
 
         if trade.get_custom_data('target_rate'):
@@ -276,11 +284,18 @@ class SupportResistance(IStrategy):
                 logging.info(f'Force exit: {current_rate} >= {trade.get_custom_data("target_rate")}')
                 return 'target_rate'
 
-        if trade.get_custom_data('bounce_count', 0) > 2:
-            if current_profit >= 0.0:
-                return 'bounce_draw'
-            elif current_profit <= -0.05:
-                return 'bounce_loss'
+        bounce_count = trade.get_custom_data('bounce_count', 0)
+        average_profit = (current_rate - trade.open_rate) / trade.open_rate
+        if bounce_count > 0 and average_profit >= 0.005:
+            return 'bounce_draw'
+
+    def custom_stoploss(self, pair: str, trade: Trade, current_time: datetime, current_rate: float,
+                        current_profit: float, after_fill: bool, **kwargs) -> Optional[float]:
+
+        bounce_count = trade.get_custom_data('bounce_count', 0)
+        if after_fill and bounce_count >= self.max_bounce_count:
+            return self.max_bounce_loss
+        return -1
 
     def adjust_trade_position(self, trade: Trade, current_time: datetime, current_rate: float, current_profit: float,
                               min_stake: Optional[float], max_stake: float, current_entry_rate: float,
@@ -288,16 +303,19 @@ class SupportResistance(IStrategy):
                               **kwargs) -> Optional[float]:
         bounce_count = trade.get_custom_data('bounce_count', 0)
         bounce_rate = trade.get_custom_data('bounce_rate', trade.open_rate)
-        if bounce_count > 2:
+        if bounce_count >= self.max_bounce_count:
             return None
-        if current_entry_rate >= bounce_rate:
+        if current_entry_rate * (1 + self.min_bounce_diff) >= bounce_rate:
             return None
-        if current_time - trade.date_last_filled_utc >= timedelta(minutes=30) and current_profit < -0.01:
-            dataframe, _ = self.dp.get_analyzed_dataframe(trade.pair, self.timeframe)
-            last_candle = dataframe.iloc[-1]
-            if current_rate <= last_candle['support_2']:
-                trade.set_custom_data('bounce_count', bounce_count + 1)
-                trade.set_custom_data('bounce_rate', current_entry_rate)
-                stake = trade.amount * current_entry_rate
-                return stake
+        if current_profit > self.start_bounce_loss:
+            return None
+        if current_time - trade.date_last_filled_utc < timedelta(minutes=self.min_bounce_interval):
+            return None
+        dataframe, _ = self.dp.get_analyzed_dataframe(trade.pair, self.timeframe)
+        last_candle = dataframe.iloc[-1]
+        if current_rate <= last_candle['support_2']:
+            trade.set_custom_data('bounce_count', bounce_count + 1)
+            trade.set_custom_data('bounce_rate', current_entry_rate)
+            stake = trade.amount * current_entry_rate
+            return stake
         return None
