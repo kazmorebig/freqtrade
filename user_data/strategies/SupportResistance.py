@@ -78,7 +78,7 @@ class SupportResistance(IStrategy):
 
     # Optimal stoploss designed for the strategy.
     # This attribute will be overridden if the config file contains "stoploss".
-    stoploss = -1.0
+    stoploss = -1
 
     # Trailing stoploss
     trailing_stop = False
@@ -93,6 +93,7 @@ class SupportResistance(IStrategy):
     use_exit_signal = True
     exit_profit_only = False
     ignore_roi_if_entry_signal = False
+    position_adjustment_enable = True
 
     # Number of candles the strategy requires before producing valid signals
     startup_candle_count: int = 200
@@ -103,7 +104,6 @@ class SupportResistance(IStrategy):
 
     plot_config = {
         "main_plot": {
-            "tema": {"color": "blue"},
             "resistance_0": {"color": "red"},
             "resistance_1": {"color": "red"},
             "resistance_2": {"color": "red"},
@@ -145,30 +145,48 @@ class SupportResistance(IStrategy):
 
         def support_agg(x, k=0):
             h, e = np.histogram(x, 50, range=(x.min(), x.iloc[-1]))
+            if h.max() < 2:
+                return np.NAN
             # h, e = np.histogram(x, 10)
             return e.take(np.argsort(h)[::-1][k])
 
         def resistance_agg(x, k=0):
             h, e = np.histogram(x, 50, range=(x.iloc[-1], x.max()))
+            if h.max() < 2:
+                return np.NAN
             # h, e = np.histogram(x, 10)
             return e.take(np.argsort(h)[::-1][k])
 
-        dataframe["rsi"] = ta.RSI(dataframe)
-        dataframe["tema"] = ta.TEMA(dataframe)
-        dataframe["support_0"] = dataframe["support_1"] = dataframe["support_2"] = dataframe["low"]
-        dataframe["resistance_0"] = dataframe["resistance_1"] = dataframe["resistance_2"] = dataframe["high"]
-        dataframe.update(dataframe.rolling(10).agg({
-            "support_0": lambda x: support_agg(x),
-            "resistance_0": lambda x: resistance_agg(x)
-        }))
-        dataframe.update(dataframe.rolling(100).agg({
-            "support_1": lambda x: support_agg(x),
-            "resistance_1": lambda x: resistance_agg(x)
-        }))
-        dataframe.update(dataframe.rolling(200).agg({
-            "support_2": lambda x: support_agg(x),
-            "resistance_2": lambda x: resistance_agg(x)
-        }))
+        # dataframe["rsi"] = ta.RSI(dataframe)
+        # dataframe["tema"] = ta.TEMA(dataframe)
+
+        # dataframe["support_0"] = dataframe["support_1"] = dataframe["support_2"] = dataframe["low"]
+        # dataframe["resistance_0"] = dataframe["resistance_1"] = dataframe["resistance_2"] = dataframe["high"]
+        # dataframe.update(dataframe.rolling(12).agg({
+        #     "support_0": lambda x: support_agg(x),
+        #     "resistance_0": lambda x: resistance_agg(x)
+        # }))
+        # dataframe.update(dataframe.rolling(100).agg({
+        #     "support_1": lambda x: support_agg(x),
+        #     "resistance_1": lambda x: resistance_agg(x)
+        # }))
+        # dataframe.update(dataframe.rolling(200).agg({
+        #     "support_2": lambda x: support_agg(x),
+        #     "resistance_2": lambda x: resistance_agg(x)
+        # }))
+
+        dataframe_1h = self.dp.get_pair_dataframe(metadata['pair'], '1h')
+
+        for i, win in enumerate([3, 9, 24]):
+            sr_1h = dataframe_1h.rolling(win).agg({
+                "low": 'min',
+                "high": 'max',
+            })
+            sr_1h = sr_1h.rename({"low": f"support_{i}", "high": f"resistance_{i}"}, axis=1)
+            # We need to shift forward because we need to set up 1H candle close time instead of open time
+            sr_1h = pd.concat([dataframe_1h['date'], sr_1h.shift(1)], axis=1)
+            dataframe = dataframe.merge(sr_1h, on='date', how='left').ffill()
+
         # Retrieve best bid and best ask from the orderbook
         # ------------------------------------
         """
@@ -191,7 +209,7 @@ class SupportResistance(IStrategy):
         :return: DataFrame with entry columns populated
         """
         # shifted = dataframe.shift(1)
-        targets = dataframe.loc[:, ("resistance_0", "resistance_1", "resistance_2")].max(axis=1)
+        targets = dataframe["resistance_0"]
         dataframe.loc[
             (
                 (dataframe["low"] < dataframe["support_1"]) &
@@ -237,17 +255,49 @@ class SupportResistance(IStrategy):
 
     def bot_loop_start(self, **kwargs) -> None:
         for trade in Trade.get_open_trades():
-            if trade.get_custom_data('target_rate') is None:
+            if trade.get_custom_data('target_rate') is None and trade.is_open:
                 dataframe, _ = self.dp.get_analyzed_dataframe(trade.pair, self.timeframe)
-                last_candle = dataframe.iloc[-2].squeeze()
-                target = max([last_candle[f'resistance_{i}'] for i in range(3)])
+                start_candle = dataframe.iloc[-1]
+                target = start_candle['resistance_0']
                 trade.set_custom_data('target_rate', target)
         return super().bot_loop_start(**kwargs)
 
     def custom_exit(self, pair: str, trade: 'Trade', current_time: 'datetime', current_rate: float,
                     current_profit: float, **kwargs):
 
+        dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+        last_candle = dataframe.iloc[-1]
+        if current_rate >= last_candle['resistance_0']:
+            if current_profit > 0.02:
+                return 'immediate_profit'
+
         if trade.get_custom_data('target_rate'):
             if current_rate >= trade.get_custom_data('target_rate'):
                 logging.info(f'Force exit: {current_rate} >= {trade.get_custom_data("target_rate")}')
-                return 'force_exit'
+                return 'target_rate'
+
+        if trade.get_custom_data('bounce_count', 0) > 2:
+            if current_profit >= 0.0:
+                return 'bounce_draw'
+            elif current_profit <= -0.05:
+                return 'bounce_loss'
+
+    def adjust_trade_position(self, trade: Trade, current_time: datetime, current_rate: float, current_profit: float,
+                              min_stake: Optional[float], max_stake: float, current_entry_rate: float,
+                              current_exit_rate: float, current_entry_profit: float, current_exit_profit: float,
+                              **kwargs) -> Optional[float]:
+        bounce_count = trade.get_custom_data('bounce_count', 0)
+        bounce_rate = trade.get_custom_data('bounce_rate', trade.open_rate)
+        if bounce_count > 2:
+            return None
+        if current_entry_rate >= bounce_rate:
+            return None
+        if current_time - trade.date_last_filled_utc >= timedelta(minutes=30) and current_profit < -0.01:
+            dataframe, _ = self.dp.get_analyzed_dataframe(trade.pair, self.timeframe)
+            last_candle = dataframe.iloc[-1]
+            if current_rate <= last_candle['support_2']:
+                trade.set_custom_data('bounce_count', bounce_count + 1)
+                trade.set_custom_data('bounce_rate', current_entry_rate)
+                stake = trade.amount * current_entry_rate
+                return stake
+        return None
