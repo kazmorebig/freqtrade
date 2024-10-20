@@ -15,7 +15,7 @@
         "entry": 10,
         "exit": 10,
         "exit_timeout_count": 0,
-        "unit": "minutes"
+        "unit": "seconds"
     },
     "entry_pricing": {
         "price_side": "same",

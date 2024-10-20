@@ -274,9 +274,10 @@ class SupportResistance(IStrategy):
                     current_profit: float, **kwargs):
 
         dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+        average_profit = (current_rate - trade.open_rate) / trade.open_rate
         last_candle = dataframe.iloc[-1]
         if current_rate >= last_candle['resistance_0']:
-            if current_profit > 0.05:
+            if average_profit > 0.05:
                 return 'immediate_profit'
 
         if trade.get_custom_data('target_rate'):
@@ -284,17 +285,21 @@ class SupportResistance(IStrategy):
                 logging.info(f'Force exit: {current_rate} >= {trade.get_custom_data("target_rate")}')
                 return 'target_rate'
 
-        bounce_count = trade.get_custom_data('bounce_count', 0)
-        average_profit = (current_rate - trade.open_rate) / trade.open_rate
-        if bounce_count > 0 and average_profit >= 0.005:
-            return 'bounce_draw'
+        # bounce_count = trade.get_custom_data('bounce_count', 0)
+        # average_profit = (current_rate - trade.open_rate) / trade.open_rate
+        # if bounce_count > 0 and average_profit >= 0.005:
+        #     return 'bounce_draw'
 
     def custom_stoploss(self, pair: str, trade: Trade, current_time: datetime, current_rate: float,
                         current_profit: float, after_fill: bool, **kwargs) -> Optional[float]:
 
         bounce_count = trade.get_custom_data('bounce_count', 0)
-        if after_fill and bounce_count >= self.max_bounce_count:
+        average_profit = (current_rate - trade.open_rate) / trade.open_rate
+        if bounce_count > 0 and average_profit > 0:
+            return stoploss_from_open(0.01, average_profit, is_short=trade.is_short)
+        elif after_fill and bounce_count >= self.max_bounce_count:
             return self.max_bounce_loss
+
         return -1
 
     def adjust_trade_position(self, trade: Trade, current_time: datetime, current_rate: float, current_profit: float,
