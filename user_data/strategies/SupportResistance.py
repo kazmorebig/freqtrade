@@ -70,7 +70,7 @@ class SupportResistance(IStrategy):
     # Minimal ROI designed for the strategy.
     # This attribute will be overridden if the config file contains "minimal_roi".
     minimal_roi = {
-        "720": 0,
+        "360": 0,
         # "60": 0.01,
         # "30": 0.02,
         # "0": 0.04
@@ -100,10 +100,13 @@ class SupportResistance(IStrategy):
     startup_candle_count: int = 200
 
     start_bounce_loss = -0.01  # Loss threshold where start to bounce
-    max_bounce_loss = -0.05  # Loss for selling bounce
-    max_bounce_count = 2  # Number of bounces from support / resistance levels
-    min_bounce_diff = 0.005  # Minimum difference between bounces
+    max_bounce_loss = -0.1  # Loss for selling bounce
+    max_bounce_count = 1  # Number of bounces from support / resistance levels
+    min_bounce_diff = 0.02  # Minimum difference between bounces
     min_bounce_interval = 30  # Minimum interval between bounces in minutes
+
+    # Leverage
+    init_leverage = 1.0
 
     # Strategy parameters
     # buy_rsi = IntParameter(10, 40, default=30, space="buy")
@@ -122,6 +125,22 @@ class SupportResistance(IStrategy):
         }
     }
 
+    def leverage(self, pair: str, current_time: datetime, current_rate: float,
+                 proposed_leverage: float, max_leverage: float, entry_tag: Optional[str], side: str,
+                 **kwargs) -> float:
+        """
+        Customize leverage for each new trade. This method is only called in futures mode.
+
+        :param pair: Pair that's currently analyzed
+        :param current_time: datetime object, containing the current datetime
+        :param current_rate: Rate, calculated based on pricing settings in exit_pricing.
+        :param proposed_leverage: A leverage proposed by the bot.
+        :param max_leverage: Max leverage allowed on this pair
+        :param entry_tag: Optional entry_tag (buy_tag) if provided with the buy signal.
+        :param side: 'long' or 'short' - indicating the direction of the proposed trade
+        :return: A leverage amount, which is between 1.0 and max_leverage.
+        """
+        return self.init_leverage
 
     def informative_pairs(self):
         """
@@ -183,17 +202,12 @@ class SupportResistance(IStrategy):
         #     "resistance_2": lambda x: resistance_agg(x)
         # }))
 
-        dataframe_1h = self.dp.get_pair_dataframe(metadata['pair'], '1h')
+        # dataframe_1h = self.dp.get_pair_dataframe(metadata['pair'], '1h')
 
-        for i, win in enumerate([3, 9, 24]):
-            sr_1h = dataframe_1h.rolling(win).agg({
-                "low": 'min',
-                "high": 'max',
-            })
-            sr_1h = sr_1h.rename({"low": f"support_{i}", "high": f"resistance_{i}"}, axis=1)
-            # We need to shift forward because we need to set up 1H candle close time instead of open time
-            sr_1h = pd.concat([dataframe_1h['date'], sr_1h.shift(1)], axis=1)
-            dataframe = dataframe.merge(sr_1h, on='date', how='left').ffill()
+        for i, win in enumerate([12, 12 * 3, 12 * 6]):
+            dataframe[f'support_{i}'] = dataframe['low'].rolling(win).min()
+            dataframe[f'resistance_{i}'] = dataframe['high'].rolling(win).max()
+
 
         # Retrieve best bid and best ask from the orderbook
         # ------------------------------------
@@ -216,12 +230,12 @@ class SupportResistance(IStrategy):
         :param metadata: Additional information, like the currently traded pair
         :return: DataFrame with entry columns populated
         """
-        # shifted = dataframe.shift(1)
+
         targets = dataframe["resistance_0"]
         dataframe.loc[
             (
-                (dataframe["low"] < dataframe["support_1"]) &
-                (targets / dataframe["close"] >= 1.005) &
+                (dataframe["low"] <= dataframe["support_0"]) &
+                (targets / dataframe["close"] >= 1.05) &
                 (dataframe["volume"] > 0)  # Make sure Volume is not 0
             ),
             "enter_long"] = 1
@@ -233,7 +247,6 @@ class SupportResistance(IStrategy):
         #         (dataframe['volume'] > 0)  # Make sure Volume is not 0
         #     ),
         #     'enter_short'] = 1
-
 
         return dataframe
 
@@ -260,6 +273,13 @@ class SupportResistance(IStrategy):
         #     'exit_short'] = 1
 
         return dataframe
+
+    def confirm_trade_entry(self, pair: str, order_type: str, amount: float, rate: float,
+                            time_in_force: str, current_time: datetime, entry_tag: Optional[str],
+                            side: str, **kwargs) -> bool:
+        if self.wallets.get_free('USDT') < self.config['stake_amount'] * (self.max_bounce_count ** 2):
+            return False
+        return True
 
     def bot_loop_start(self, **kwargs) -> None:
         for trade in Trade.get_open_trades():
@@ -295,6 +315,9 @@ class SupportResistance(IStrategy):
 
         bounce_count = trade.get_custom_data('bounce_count', 0)
         average_profit = (current_rate - trade.open_rate) / trade.open_rate
+        if current_time - trade.open_date_utc >= timedelta(hours=3):
+            if average_profit > 0.02:
+                return 0.01
         if bounce_count > 0 and average_profit > 0:
             return stoploss_from_open(0.01, average_profit, is_short=trade.is_short)
         elif after_fill and bounce_count >= self.max_bounce_count:
@@ -317,10 +340,10 @@ class SupportResistance(IStrategy):
         if current_time - trade.date_last_filled_utc < timedelta(minutes=self.min_bounce_interval):
             return None
         dataframe, _ = self.dp.get_analyzed_dataframe(trade.pair, self.timeframe)
-        last_candle = dataframe.iloc[-1]
+        last_candle = dataframe.iloc[-2]
         if current_rate <= last_candle['support_2']:
             trade.set_custom_data('bounce_count', bounce_count + 1)
             trade.set_custom_data('bounce_rate', current_entry_rate)
-            stake = trade.amount * current_entry_rate
+            stake = trade.amount * current_entry_rate / trade.leverage
             return stake
         return None
